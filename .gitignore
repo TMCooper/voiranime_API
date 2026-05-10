@@ -1,3 +1,6 @@
 venv
-downloaded_files
+tests
 *.html
+__pycache__
+data
+downloaded_files
