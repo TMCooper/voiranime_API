@@ -27,7 +27,7 @@ run_api.bat
 ```
 L'API sera disponible sur : `http://127.0.0.1:8000`
 
-> **Astuce** : Accédez à `http://127.0.0.1:8000/docs` pour une interface graphique interactive (Swagger UI) permettant de tester toutes les routes sans coder.
+> **Astuce** : Accédez à `http://127.0.0.1:8000/docs` pour une interface graphique interactive (Swagger UI) permettant de tester toutes les routes sans coder. aussi lors de la première recuperation des different animer prennez en compte que celle ci peut être un peut longue laissez donc le temps au code de faire son travaille
 
 ---
 
