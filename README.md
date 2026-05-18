@@ -49,7 +49,7 @@ L'API sera disponible sur : `http://127.0.0.1:8000`
   ```
 
 #### `POST /catalog/update`
-- **Description** : Lance un script SeleniumBase en arrière-plan pour scanner la totalité des pages de VoirAnime (environ 330+ pages) et mettre à jour `catalog.json`. Cette route est la seule à utiliser Selenium pour contourner les protections (Cloudflare).
+- **Description** : Lance un script SeleniumBase en arrière-plan pour scanner la totalité des pages de VoirAnime (environ 330+ pages) et mettre à jour `catalog.json`.
 - **Paramètres** : `max_pages` (optionnel, défaut: 1000)
 - **Retour** : Message de confirmation du lancement de la tâche.
 
