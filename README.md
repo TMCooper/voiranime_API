@@ -15,7 +15,7 @@ voiranime_API/
 │   └── core/
 │       └── scraper.py       # Logique métier asynchrone (Classe VoirAnimeScraper)
 ├── venv/                    # Environnement virtuel Python
-└── run_api.bat              # Script de lancement
+└── main.py                  # Programme de lancement de l'API
 ```
 
 ## Lancement
