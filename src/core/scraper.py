@@ -1,10 +1,9 @@
 import json
 import os
 import asyncio
-import aiohttp
-import requests
+import httpx
 from bs4 import BeautifulSoup
-from seleniumbase import Driver
+from src.core.resolver import StreamResolver
 
 class VoirAnimeScraper:
     def __init__(self, data_dir="data"):
@@ -22,153 +21,235 @@ class VoirAnimeScraper:
             "current_page": 0,
             "total_animes": 0
         }
+        self.catalog = self.load_catalog()
+        self.client = None
+        self.resolver = StreamResolver(headers=self.headers)
+
+    def init_client(self):
+        if self.client is None or self.client.is_closed:
+            self.client = httpx.AsyncClient(
+                headers=self.headers,
+                timeout=10.0,
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=30, max_keepalive_connections=15)
+            )
+
+    async def close_client(self):
+        if self.client and not self.client.is_closed:
+            await self.client.aclose()
+            self.client = None
+
+    def _get_active_client(self, provided_client=None):
+        if provided_client is not None:
+            return provided_client, False
+        if self.client is not None and not self.client.is_closed:
+            return self.client, False
+        return httpx.AsyncClient(
+            headers=self.headers,
+            timeout=10.0,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=30, max_keepalive_connections=15)
+        ), True
 
     def load_catalog(self):
         if os.path.exists(self.catalog_file):
-            with open(self.catalog_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+            try:
+                with open(self.catalog_file, "r", encoding="utf-8") as f:
+                    self.catalog = json.load(f)
+                    return self.catalog
+            except Exception as e:
+                print(f"Error loading catalog file: {e}")
+        self.catalog = {}
         return {}
 
-    def save_catalog(self, catalog):
+    def save_catalog(self, catalog=None):
+        if catalog is not None:
+            self.catalog = catalog
         with open(self.catalog_file, "w", encoding="utf-8") as f:
-            json.dump(catalog, f, indent=4, ensure_ascii=False)
+            json.dump(self.catalog, f, indent=4, ensure_ascii=False)
 
     def resolve_anime(self, anime_name):
-        catalog = self.load_catalog()
+        if not self.catalog:
+            self.load_catalog()
+            
         search_words = anime_name.lower().strip().split()
-        
         matches = []
-        for name, link in catalog.items():
+        for name, link in self.catalog.items():
             name_lower = name.lower()
-            # On vérifie que TOUS les mots de la recherche sont dans le nom de l'anime
             if all(word in name_lower for word in search_words):
                 matches.append({"name": name, "url": link})
         return matches
 
-    def update_catalog(self, max_pages=1000):
+    async def _fetch_catalog_page(self, client, page):
+        url = f"https://voir-anime.to/liste-danimes/page/{page}/" if page > 1 else "https://voir-anime.to/liste-danimes/"
+        try:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return page, {}
+                
+            soup = BeautifulSoup(resp.text, 'lxml')
+            items = soup.find_all("div", class_="item-summary")
+            if not items:
+                items = soup.find_all("h3", class_="h4")
+                
+            page_animes = {}
+            for item in items:
+                a_tag = item.find("a")
+                if a_tag:
+                    name = a_tag.text.strip()
+                    link = a_tag.get("href")
+                    if name and link:
+                        page_animes[name] = link
+            return page, page_animes
+        except Exception as e:
+            print(f"Error scraping catalog page {page}: {e}")
+            return page, {}
+
+    async def update_catalog(self, max_pages=1000, client=None, batch_size=10):
         self.update_status["is_updating"] = True
         self.update_status["current_page"] = 0
         
-        driver = None
-        catalog = self.load_catalog()
+        http_client, should_close = self._get_active_client(client)
+        catalog = self.catalog.copy()
         self.update_status["total_animes"] = len(catalog)
         
         try:
-            driver = Driver(browser="chrome", uc=True, headless2=True)
-            page = 1
-            while page <= max_pages:
-                url = f"https://voir-anime.to/liste-danimes/page/{page}/" if page > 1 else "https://voir-anime.to/liste-danimes/"
-                driver.get(url)
+            current_page = 1
+            while current_page <= max_pages:
+                pages_to_fetch = list(range(current_page, min(current_page + batch_size, max_pages + 1)))
+                tasks = [self._fetch_catalog_page(http_client, p) for p in pages_to_fetch]
+                results = await asyncio.gather(*tasks)
                 
-                # Attente pour s'assurer que Cloudflare est passé
-                import time
-                for _ in range(3):
-                    title = driver.title
-                    if title and "Just a moment" not in title and "Cloudflare" not in title:
+                stop_update = False
+                for page_num, page_animes in sorted(results, key=lambda x: x[0]):
+                    if not page_animes:
+                        stop_update = True
                         break
-                    time.sleep(3)
+                        
+                    catalog.update(page_animes)
+                    self.update_status["current_page"] = page_num
+                    self.update_status["total_animes"] = len(catalog)
                     
-                html = driver.page_source
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                items = soup.find_all("div", class_="item-summary")
-                if not items:
-                    items = soup.find_all("h3", class_="h4")
-                    
-                if not items:
-                    break
-                    
-                added_on_page = 0
-                for item in items:
-                    a_tag = item.find("a")
-                    if a_tag:
-                        name = a_tag.text.strip()
-                        link = a_tag.get("href")
-                        if name and link:
-                            catalog[name] = link
-                            added_on_page += 1
-                            
-                if added_on_page == 0:
-                    break
-                
-                page += 1
-                
-                # Sauvegarde incrémentale toutes les pages pour que l'utilisateur voie la progression
                 self.save_catalog(catalog)
-                self.update_status["current_page"] = page - 1
-                self.update_status["total_animes"] = len(catalog)
-                print(f"[Mise à jour] Page {page-1} scannée avec succès. Animes totaux: {len(catalog)}")
+                print(f"[Mise à jour] Lot terminé jusqu'à la page {self.update_status['current_page']}. Total animes: {len(catalog)}")
+                
+                if stop_update:
+                    break
+                    
+                current_page += batch_size
                 
         except Exception as e:
             print(f"Error updating catalog: {e}")
         finally:
             self.update_status["is_updating"] = False
-            if driver:
-                driver.quit()
-            
+            if should_close:
+                await http_client.aclose()
+                
         self.save_catalog(catalog)
         return catalog
 
-    def fetch_episodes(self, anime_url):
+    async def fetch_episodes(self, anime_url, client=None):
+        http_client, should_close = self._get_active_client(client)
         try:
-            resp = requests.get(anime_url, headers=self.headers, timeout=10)
-            resp.raise_for_status()
-        except requests.RequestException:
+            resp = await http_client.get(anime_url)
+            if resp.status_code != 200:
+                return []
+            soup = BeautifulSoup(resp.text, 'lxml')
+            episodes = []
+            chapter_list = soup.find_all("li", class_="wp-manga-chapter")
+            for li in chapter_list:
+                a_tag = li.find("a")
+                if a_tag:
+                    ep_name = a_tag.text.strip()
+                    ep_link = a_tag.get("href")
+                    episodes.append({
+                        "title": ep_name,
+                        "url": ep_link
+                    })
+            return episodes
+        except Exception as e:
+            print(f"Error fetching episodes from {anime_url}: {e}")
             return []
+        finally:
+            if should_close:
+                await http_client.aclose()
 
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        episodes = []
-        
-        chapter_list = soup.find_all("li", class_="wp-manga-chapter")
-        for li in chapter_list:
-            a_tag = li.find("a")
-            if a_tag:
-                ep_name = a_tag.text.strip()
-                ep_link = a_tag.get("href")
-                episodes.append({
-                    "title": ep_name,
-                    "url": ep_link
-                })
-                
-        return episodes
-
-    def fetch_download_link(self, episode_url):
+    async def fetch_download_link(self, episode_url, client=None, resolve_stream=True):
+        http_client, should_close = self._get_active_client(client)
         try:
-            resp = requests.get(episode_url, headers=self.headers, timeout=10)
-            resp.raise_for_status()
-        except requests.RequestException:
+            resp = await http_client.get(episode_url)
+            if resp.status_code != 200:
+                return None
+            soup = BeautifulSoup(resp.text, 'lxml')
+            iframes = soup.find_all("iframe")
+            iframe_url = None
+            for iframe in iframes:
+                src = iframe.get("src")
+                if src and "voiranime" not in src:
+                    iframe_url = src
+                    break
+                    
+            if not iframe_url:
+                return None
+
+            if resolve_stream:
+                resolved = await self.resolver.resolve(iframe_url, client=http_client)
+                return {
+                    "iframe_url": iframe_url,
+                    "stream_url": resolved.get("stream_url"),
+                    "stream_type": resolved.get("type"),
+                    "host": resolved.get("host")
+                }
+            return iframe_url
+        except Exception as e:
+            print(f"Error fetching download link from {episode_url}: {e}")
             return None
+        finally:
+            if should_close:
+                await http_client.aclose()
 
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        iframes = soup.find_all("iframe")
-        for iframe in iframes:
-            src = iframe.get("src")
-            if src and "voiranime" not in src:
-                return src
-        return None
-
-    async def _fetch_single_iframe_async(self, session, episode):
+    async def _fetch_single_iframe_async(self, http_client, episode):
         try:
-            async with session.get(episode["url"], timeout=10) as response:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                iframes = soup.find_all("iframe")
-                for iframe in iframes:
-                    src = iframe.get("src")
-                    if src and "voiranime" not in src:
-                        return {**episode, "video_url": src}
+            resolved_data = await self.fetch_download_link(episode["url"], client=http_client, resolve_stream=True)
+            if isinstance(resolved_data, dict):
+                return {
+                    **episode,
+                    "iframe_url": resolved_data.get("iframe_url"),
+                    "video_url": resolved_data.get("stream_url") or resolved_data.get("iframe_url"),
+                    "stream_url": resolved_data.get("stream_url"),
+                    "stream_type": resolved_data.get("stream_type"),
+                    "host": resolved_data.get("host")
+                }
+            return {
+                **episode,
+                "iframe_url": resolved_data,
+                "video_url": resolved_data,
+                "stream_url": None,
+                "stream_type": None,
+                "host": None
+            }
         except Exception:
-            pass
-        return {**episode, "video_url": None}
+            return {
+                **episode,
+                "iframe_url": None,
+                "video_url": None,
+                "stream_url": None,
+                "stream_type": None,
+                "host": None
+            }
 
-    async def _fetch_all_iframes_async(self, episodes):
-        async with aiohttp.ClientSession(headers=self.headers) as session:
-            tasks = [self._fetch_single_iframe_async(session, ep) for ep in episodes]
-            return await asyncio.gather(*tasks)
+    async def fetch_all_episodes_with_links(self, anime_url, client=None):
+        http_client, should_close = self._get_active_client(client)
+        try:
+            episodes = await self.fetch_episodes(anime_url, client=http_client)
+            if not episodes:
+                return []
+            
+            tasks = [self._fetch_single_iframe_async(http_client, ep) for ep in episodes]
+            results = await asyncio.gather(*tasks)
+            return list(results)
+        finally:
+            if should_close:
+                await http_client.aclose()
 
-    def fetch_all_episodes_with_links(self, anime_url):
-        episodes = self.fetch_episodes(anime_url)
-        if not episodes:
-            return []
-        
-        return asyncio.run(self._fetch_all_iframes_async(episodes))
+

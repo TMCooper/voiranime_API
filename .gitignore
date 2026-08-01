@@ -4,3 +4,4 @@ tests
 __pycache__
 data
 downloaded_files
+.pytest_cache
