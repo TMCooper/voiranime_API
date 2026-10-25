@@ -1,160 +1,113 @@
 # VoirAnime API
 
-Une API ultra-rapide et 100% asynchrone pour extraire le catalogue, chercher des animes, et récupérer les liens vidéo (iframes) directement depuis VoirAnime. 
+Une API ultra-rapide et 100% asynchrone pour extraire le catalogue, chercher des animes, et récupérer les liens vidéo directs depuis VoirAnime. 
 
-L'architecture est entièrement légère, s'appuyant sur des requêtes HTTP/2 asynchrones par lots (`httpx` / `curl_cffi`) et le parseur haute performance `lxml`, éliminant totalement le besoin de navigateurs lourds (SeleniumBase / Playwright).
+Cette API est **100% compatible avec l'architecture de `AnimeSamaApi`** afin de permettre à des wrappers unifiés comme **`YoitsuWrap`** de fonctionner de manière interchangeable sur les deux plateformes sans modification de code.
 
 ## Structure du Projet
 
 ```text
 voiranime_API/
 ├── data/
-│   └── catalog.json         # Base de données locale de tous les animes
+│   ├── catalog.json             # Base de données locale de tous les animes
+│   └── covers.json              # Cache local des images de couverture
 ├── src/
-│   ├── main.py              # Application FastAPI (les routes asynchrones)
+│   ├── main.py                  # Application FastAPI (routes standardisées & legacy)
 │   └── core/
-│       └── scraper.py       # Logique métier asynchrone (Classe VoirAnimeScraper)
-├── venv/                    # Environnement virtuel Python
-└── main.py                  # Programme de lancement de l'API
+│       ├── scraper.py           # Logique de scraping et de recherche floue (VoirAnimeScraper)
+│       └── resolver.py          # Résolveur universel de lecteurs vidéo (StreamResolver)
+├── tests/
+│   └── test_animesama_compat.py # Suite de validation de compatibilité AnimeSama / YoitsuWrap
+├── main.py                      # Point d'entrée pour lancer le serveur API
 ```
 
 ## Lancement
 
-Pour démarrer le serveur API, exécutez le script suivant à la racine du projet :
+Pour démarrer le serveur API :
 ```bash
-run_api.bat
+python main.py
 ```
 L'API sera disponible sur : `http://127.0.0.1:8000`
-
-> **Astuce** : Accédez à `http://127.0.0.1:8000/docs` pour une interface graphique interactive (Swagger UI) permettant de tester toutes les routes en direct. La mise à jour complète du catalogue prend désormais moins de 20 secondes pour plus de 330 pages !
-
----
-
-## Documentation des Routes
-
-### 1. Gestion du Catalogue
-
-#### `GET /catalog`
-- **Description** : Renvoie le contenu entier du fichier `catalog.json` stocké en mémoire RAM. Ultra-rapide et instantané.
-- **Retour** : 
-  ```json
-  {
-    "total": 42,
-    "catalog": {
-      "Frieren": "https://voir-anime.to/anime/frieren-beyond-journey-end/",
-      "...": "..."
-    }
-  }
-  ```
-
-#### `POST /catalog/update` ou `GET /catalog/update`
-- **Description** : Lance la mise à jour complète du catalogue en arrière-plan par lots asynchrones (10 pages simultanées). Scanne l'intégralité du site (~330+ pages, ~2000+ animes) en moins de 20 secondes sans aucun navigateur Chrome.
-- **Paramètres** : `max_pages` (optionnel, défaut: 1000)
-- **Retour** : Message de confirmation du lancement de la tâche.
+La documentation interactive Swagger est accessible sur : `http://127.0.0.1:8000/docs`
 
 ---
 
-### 2. Résolution & Épisodes
+## Routes Compatibles AnimeSamaApi & YoitsuWrap (`/api/...`)
 
-#### `GET /anime/search`
-- **Description** : Recherche un anime dans votre catalogue local par son nom (supporte les recherches partielles). Utile pour différencier les différentes saisons (ex: Saison 2, VF, VOSTFR).
-- **Paramètre** : `query` (ex: `Frieren`)
-- **Exemple de lien complet** : `http://127.0.0.1:8000/anime/search?query=Frieren`
-- **Retour** :
-  ```json
-  {
-    "total_results": 2,
-    "results": [
-      {
-        "name": "Frieren",
-        "url": "https://voir-anime.to/anime/frieren-beyond-journey-end/"
-      },
-      {
-        "name": "Frieren (VF)",
-        "url": "https://voir-anime.to/anime/frieren-beyond-journey-end-vf/"
-      }
-    ]
-  }
-  ```
+Ces routes fournissent les mêmes formats, noms de paramètres et structures de données que l'API AnimeSama (`Cardinal` / `Yui`) :
 
-#### `GET /episodes`
-- **Description** : À partir d'une URL d'anime exacte, récupère la liste de tous ses épisodes et leurs URL correspondantes.
-- **Paramètre** : `anime_url` (ex: `https://voir-anime.to/anime/sousou-no-frieren/`)
-- **Retour** :
-  ```json
+| Méthode | Route | Description | Paramètres |
+|---|---|---|---|
+| `GET` | `/status` & `/api/status` | Statut en ligne de l'API | Aucun |
+| `GET` | `/config` | Renvoie l'IP et le PORT de l'API | Aucun |
+| `GET` | `/api/getAnimeSamaURL` / `getVoirAnimeURL` | Renvoie l'URL source de base | Aucun |
+| `GET` | `/api/loadBaseAnimeData` | Charge la liste globale des animes (`title`, `link`, `cover`) | Aucun |
+| `GET` | `/api/getAllAnime` | Charge la liste ou déclenche une màj si `r=True` | `r` (optionnel) |
+| `GET` | `/api/getSerchAnime` | Recherche floue avec score (Fuzzy Matching RapidFuzz) | `q` (query), `l` (limit, défaut: 5) |
+| `GET` | `/api/getInfoAnime` | Liste les saisons d'une œuvre pour initialiser `YoitsuWrap` | `q` (nom de l'anime) |
+| `GET` | `/api/getSpecificAnime` | Récupère la saison et version linguistique voulue | `q` (nom), `s` (saison), `v` (vostfr/vf) |
+| `GET` | `/api/getAnimeLink` | Retourne la liste des épisodes avec liens directs (`.m3u8`/`.mp4`) | `n` (nom), `s` (saison), `v` (vostfr/vf) |
+| `GET` | `/api/getScanHashmap` | Sécurité pour YoitsuWrap (renvoie `{title, max_chapter: 0}`) | `n` (nom) |
+| `GET` | `/api/getScanLink` | Sécurité pour YoitsuWrap (renvoie `{}`) | `n` (nom), `c` (chapitre) |
+
+### Exemples d'utilisation
+
+#### 1. Recherche : `/api/getSerchAnime?q=Frieren`
+```json
+[
   {
-    "total_episodes": 25,
-    "episodes": [
-      {
-        "title": "Frieren - 01 VOSTFR - 01",
-        "url": "https://voir-anime.to/anime/frieren-beyond-journey-end/frieren-01-vostfr-01/"
-      }
-    ]
+    "title": "Sousou no Frieren",
+    "lien": "https://voir-anime.to/anime/sousou-no-frieren/",
+    "cover": "https://voir-anime.to/wp-content/uploads/2023/09/thumb_650d6d2a0493b.jpg",
+    "score": 100.0
   }
-  ```
+]
+```
+
+#### 2. Informations Saisons : `/api/getInfoAnime?q=Frieren`
+```json
+[
+  {
+    "base_url": "https://voir-anime.to/anime/sousou-no-frieren/",
+    "title": "Sousou no Frieren",
+    "cover": "https://voir-anime.to/wp-content/uploads/2023/09/thumb_650d6d2a0493b.jpg",
+    "Saison": "Saison 1",
+    "url": "https://voir-anime.to/anime/sousou-no-frieren/"
+  },
+  {
+    "base_url": "https://voir-anime.to/anime/sousou-no-frieren/",
+    "title": "Sousou no Frieren",
+    "cover": "https://voir-anime.to/wp-content/uploads/2023/09/thumb_650d6d2a0493b.jpg",
+    "Saison": "Saison 2",
+    "url": "https://voir-anime.to/anime/sousou-no-frieren-2/"
+  }
+]
+```
+
+#### 3. Épisodes et Flux Vidéo : `/api/getAnimeLink?n=Frieren&s=saison1&v=vostfr`
+```json
+[
+  {
+    "episode": 1,
+    "url": "https://delivery.voe.sx/hls/..."
+  },
+  {
+    "episode": 2,
+    "url": "https://delivery.voe.sx/hls/..."
+  }
+]
+```
 
 ---
 
-### 3. Les Surcouches Vidéo & Resolver de Flux
+## Routes Historiques VoirAnime (Rétro-compatibilité)
 
-Ces routes sont conçues pour être exploitées par des lecteurs vidéo et interfaces graphiques. Elles extraient ET résolvent automatiquement les lecteurs (Vidmoly, Sibnet, Sendvid...) en liens vidéo directs prêts à l'emploi (`.m3u8` HLS / `.mp4`).
-
-#### `GET /resolve` (Nouveau)
-- **Description** : Prend une URL d'embed lecteur (ex: `https://vidmoly.biz/embed-ce2b8bs6lycx.html` ou Sibnet/Sendvid) et extrait le lien vidéo direct prêt à être lu dans un lecteur vidéo (VLC, HTML5 `<video>`, etc.).
-- **Paramètre** : `embed_url`
-- **Exemple** : `http://127.0.0.1:8000/resolve?embed_url=https://vidmoly.biz/embed-ce2b8bs6lycx.html`
-- **Retour** :
-  ```json
-  {
-    "status": "success",
-    "host": "vidmoly",
-    "stream_url": "https://box-1096-q.vmeas.cloud/hls/.../master.m3u8",
-    "type": "hls",
-    "embed_url": "https://vidmoly.biz/embed-ce2b8bs6lycx.html"
-  }
-  ```
-
----
-
-#### `GET /download/all` (Recommandé)
-- **Description** : Récupère tous les épisodes d'un anime et résout de manière 100% asynchrone tous les flux vidéo directs prêts à l'emploi.
-- **Paramètre** : `anime_name` (ex: `Frieren`)
-- **Exemple** : `http://127.0.0.1:8000/download/all?anime_name=Frieren`
-- **Retour** :
-  ```json
-  {
-    "anime": "Frieren",
-    "total_episodes": 25,
-    "episodes": [
-      {
-        "title": "Frieren - 01 VOSTFR - 01",
-        "url": "https://voir-anime.to/anime/frieren-beyond-journey-end/frieren-01-vostfr-01/",
-        "iframe_url": "https://vidmoly.biz/embed-0v50iamolxhq.html",
-        "stream_url": "https://gate-2-an-p.vmnow.online/hls2/.../master.m3u8",
-        "stream_type": "hls",
-        "host": "vidmoly",
-        "video_url": "https://gate-2-an-p.vmnow.online/hls2/.../master.m3u8"
-      }
-    ]
-  }
-  ```
-
----
-
-#### `GET /download/single`
-- **Description** : Récupère et résout le lien vidéo direct d'un épisode spécifique.
-- **Paramètres** : 
-  - `anime_name` (ex: `Frieren`)
-  - `episode_num` (ex: `01`)
-- **Retour** :
-  ```json
-  {
-    "anime": "Frieren",
-    "episode_title": "Frieren - 01 VOSTFR - 01",
-    "iframe_url": "https://vidmoly.biz/embed-0v50iamolxhq.html",
-    "stream_url": "https://gate-2-an-p.vmnow.online/hls2/.../master.m3u8",
-    "stream_type": "hls",
-    "host": "vidmoly",
-    "video_url": "https://gate-2-an-p.vmnow.online/hls2/.../master.m3u8"
-  }
-  ```
+Toutes les routes historiques ont été conservées :
+- `GET /catalog` : Liste brute du catalogue `{ nom: url }`.
+- `GET /catalog/status` : Statut en direct de la mise à jour asynchrone.
+- `POST /catalog/update` : Déclenche la mise à jour asynchrone du catalogue.
+- `GET /anime/search?query=...` : Recherche dans le catalogue.
+- `GET /episodes?anime_url=...` : Liste des épisodes sans résolution vidéo.
+- `GET /download/all?anime_name=...` : Récupère tous les épisodes avec les iframes.
+- `GET /download/single?anime_name=...&episode_num=...` : Récupère un seul épisode résolu.
+- `GET /resolve?embed_url=...` : Résout une URL d'embed (Vidmoly, VOE, Streamtape, Sendvid...).
