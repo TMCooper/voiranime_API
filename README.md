@@ -64,13 +64,14 @@ Ces routes fournissent les mêmes formats, noms de paramètres et structures de 
 ]
 ```
 
-#### 2. Informations Saisons : `/api/getInfoAnime?q=Frieren`
+#### 2. Informations Saisons & Synopsis : `/api/getInfoAnime?q=Frieren`
 ```json
 [
   {
     "base_url": "https://voir-anime.to/anime/sousou-no-frieren/",
     "title": "Sousou no Frieren",
     "cover": "https://voir-anime.to/wp-content/uploads/2023/09/thumb_650d6d2a0493b.jpg",
+    "synopsis": "Que deviennent les héros une fois le mal vaincu ?\n\nLe jeune héros Himmel et ses compagnons...",
     "Saison": "Saison 1",
     "url": "https://voir-anime.to/anime/sousou-no-frieren/"
   },
@@ -78,6 +79,7 @@ Ces routes fournissent les mêmes formats, noms de paramètres et structures de 
     "base_url": "https://voir-anime.to/anime/sousou-no-frieren/",
     "title": "Sousou no Frieren",
     "cover": "https://voir-anime.to/wp-content/uploads/2023/09/thumb_650d6d2a0493b.jpg",
+    "synopsis": "Que deviennent les héros une fois le mal vaincu ?\n\nLe jeune héros Himmel et ses compagnons...",
     "Saison": "Saison 2",
     "url": "https://voir-anime.to/anime/sousou-no-frieren-2/"
   }

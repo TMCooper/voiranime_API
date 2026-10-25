@@ -351,70 +351,74 @@ class VoirAnimeScraper:
             or soup.select_one('.description-summary')
         )
         if not desc_node:
+            og_desc = soup.find('meta', property='og:description')
+            if og_desc and og_desc.get('content'):
+                return og_desc['content'].strip()
             return ""
+
         p_tags = desc_node.find_all('p')
         if p_tags:
             paragraphs = [p.get_text(strip=True).replace('\xa0', ' ') for p in p_tags if p.get_text(strip=True)]
             if paragraphs:
                 return "\n\n".join(paragraphs).strip()
-        return desc_node.get_text(separator="\n", strip=True).replace('\xa0', ' ')
 
-    async def _fetch_synopsis(self, anime_url: str, client=None) -> str:
-        if not anime_url:
-            return ""
-        if anime_url in self.synopses and self.synopses[anime_url]:
-            return self.synopses[anime_url]
+        text = desc_node.get_text(separator="\n\n", strip=True).replace('\xa0', ' ')
+        if text:
+            return text
 
-        http_client, should_close = self._get_active_client(client)
-        try:
-            r = await http_client.get(anime_url)
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, 'lxml')
-                synopsis = self._extract_synopsis_from_soup(soup)
-                if synopsis:
-                    self.synopses[anime_url] = synopsis
-                    self.save_synopses()
-                    return synopsis
-        except Exception as e:
-            print(f"Error fetching synopsis for '{anime_url}': {e}")
-        finally:
-            if should_close:
-                await http_client.aclose()
+        og_desc = soup.find('meta', property='og:description')
+        if og_desc and og_desc.get('content'):
+            return og_desc['content'].strip()
         return ""
 
-    async def _fetch_cover_if_missing(self, anime_name: str, anime_url: str, client=None) -> str:
-        if anime_name in self.covers and self.covers[anime_name]:
-            return self.covers[anime_name]
+    async def _fetch_metadata_if_missing(self, anime_name: str, anime_url: str, client=None) -> tuple[str, str]:
+        cover = self.covers.get(anime_name, "")
+        synopsis = self.synopses.get(anime_url, "")
+        if not synopsis and anime_name:
+            synopsis = self.synopses.get(anime_name, "")
+
+        if cover and synopsis:
+            return cover, synopsis
 
         http_client, should_close = self._get_active_client(client)
         try:
             r = await http_client.get(anime_url)
             if r.status_code == 200:
                 soup = BeautifulSoup(r.text, 'lxml')
-                if anime_url not in self.synopses:
-                    syn = self._extract_synopsis_from_soup(soup)
-                    if syn:
-                        self.synopses[anime_url] = syn
+                if not synopsis:
+                    synopsis = self._extract_synopsis_from_soup(soup)
+                    if synopsis:
+                        self.synopses[anime_url] = synopsis
+                        if anime_name:
+                            self.synopses[anime_name] = synopsis
                         self.save_synopses()
 
-                og = soup.find('meta', property='og:image')
-                if og and og.get('content'):
-                    cover_url = og['content']
-                    self.covers[anime_name] = cover_url
-                    self.save_covers()
-                    return cover_url
-                img = soup.select_one('.summary_image img')
-                if img and img.get('src'):
-                    cover_url = img['src']
-                    self.covers[anime_name] = cover_url
-                    self.save_covers()
-                    return cover_url
-        except Exception:
-            pass
+                if not cover:
+                    og = soup.find('meta', property='og:image')
+                    if og and og.get('content'):
+                        cover = og['content']
+                        self.covers[anime_name] = cover
+                        self.save_covers()
+                    else:
+                        img = soup.select_one('.summary_image img')
+                        if img and img.get('src'):
+                            cover = img['src']
+                            self.covers[anime_name] = cover
+                            self.save_covers()
+        except Exception as e:
+            print(f"Error fetching metadata for '{anime_url}': {e}")
         finally:
             if should_close:
                 await http_client.aclose()
-        return ""
+        return cover, synopsis
+
+    async def _fetch_cover_if_missing(self, anime_name: str, anime_url: str, client=None) -> str:
+        cover, _ = await self._fetch_metadata_if_missing(anime_name, anime_url, client=client)
+        return cover
+
+    async def _fetch_synopsis(self, anime_url: str, anime_name: str = "", client=None) -> str:
+        _, synopsis = await self._fetch_metadata_if_missing(anime_name, anime_url, client=client)
+        return synopsis
 
     async def get_info_anime(self, query: str) -> list:
         """
@@ -425,6 +429,7 @@ class VoirAnimeScraper:
                 "base_url": "...",
                 "title": "Sousou no Frieren",
                 "cover": "...",
+                "synopsis": "...",
                 "Saison": "Saison 1",
                 "url": "..."
             },
@@ -457,7 +462,7 @@ class VoirAnimeScraper:
         if not franchise_entries:
             franchise_entries = [(base_title, base_url)]
 
-        cover = await self._fetch_cover_if_missing(base_title, base_url)
+        cover, synopsis = await self._fetch_metadata_if_missing(base_title, base_url, client=self.client)
 
         # Classifier en saisons / films / OAVs / Remakes
         seasons_map = {} # label -> {"vostfr": url, "vf": url, "main_url": url}
@@ -484,6 +489,7 @@ class VoirAnimeScraper:
                 "base_url": base_url,
                 "title": root_name,
                 "cover": cover,
+                "synopsis": synopsis,
                 "Saison": s_label,
                 "url": primary_url,
                 "_vostfr_url": urls["vostfr"],
@@ -564,10 +570,12 @@ class VoirAnimeScraper:
         elif version_str == "vostfr" and selected.get("_vostfr_url"):
             target_url = selected["_vostfr_url"]
 
-        # Récupération du synopsis depuis la page de l'anime (avec cache)
-        synopsis = await self._fetch_synopsis(target_url, client=self.client)
-        if not synopsis and selected.get("base_url") and selected["base_url"] != target_url:
-            synopsis = await self._fetch_synopsis(selected["base_url"], client=self.client)
+        # Récupération du synopsis : priorité au synopsis déjà extrait, sinon fetch
+        synopsis = selected.get("synopsis") or ""
+        if not synopsis:
+            synopsis = await self._fetch_synopsis(target_url, anime_name=selected.get("title", ""), client=self.client)
+            if not synopsis and selected.get("base_url") and selected["base_url"] != target_url:
+                synopsis = await self._fetch_synopsis(selected["base_url"], anime_name=selected.get("title", ""), client=self.client)
 
         return {
             "base_url": selected["base_url"],

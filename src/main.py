@@ -108,12 +108,13 @@ async def serch_anime(
 async def get_info_anime(q: str = Query(..., description="Nom de l'anime (ex: Frieren)")):
     """
     Retourne la liste des saisons disponibles pour un anime sous le format exact
-    attendu par YoitsuWrap :
+    attendu par YoitsuWrap et Cardinal :
     [
         {
             "base_url": "...",
             "title": "Sousou no Frieren",
             "cover": "...",
+            "synopsis": "...",
             "Saison": "Saison 1",
             "url": "..."
         },
