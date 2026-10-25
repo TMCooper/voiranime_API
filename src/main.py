@@ -134,7 +134,15 @@ async def get_specific_anime(
     v: Optional[str] = Query("vostfr", description="Version linguistique (vostfr ou vf)")
 ):
     """
-    Retourne l'objet de saison ciblé avec l'URL adaptée à la version (VOSTFR / VF).
+    Retourne l'objet de saison ciblé avec l'URL adaptée à la version (VOSTFR / VF) et le synopsis :
+    {
+        "base_url": "...",
+        "title": "Sousou no Frieren",
+        "cover": "...",
+        "synopsis": "...",
+        "Saison": "Saison 1",
+        "url": "..."
+    }
     """
     if not q.strip():
         raise HTTPException(status_code=400, detail="Paramètre 'q' manquant")

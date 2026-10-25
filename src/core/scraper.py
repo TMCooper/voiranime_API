@@ -17,6 +17,7 @@ class VoirAnimeScraper:
         self.catalog_file = os.path.join(self.data_dir, "catalog.json")
         self.covers_file = os.path.join(self.data_dir, "covers.json")
         self.aliases_file = os.path.join(self.data_dir, "aliases.json")
+        self.synopses_file = os.path.join(self.data_dir, "synopses.json")
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -38,6 +39,7 @@ class VoirAnimeScraper:
         self.catalog = self.load_catalog()
         self.covers = self.load_covers()
         self.aliases = self.load_aliases()
+        self.synopses = self.load_synopses()
         self.client = None
         self.resolver = StreamResolver(headers=self.headers)
 
@@ -117,6 +119,24 @@ class VoirAnimeScraper:
         try:
             with open(self.aliases_file, "w", encoding="utf-8") as f:
                 json.dump(self.aliases, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def load_synopses(self):
+        if os.path.exists(self.synopses_file):
+            try:
+                with open(self.synopses_file, "r", encoding="utf-8") as f:
+                    self.synopses = json.load(f)
+                    return self.synopses
+            except Exception:
+                pass
+        self.synopses = {}
+        return {}
+
+    def save_synopses(self):
+        try:
+            with open(self.synopses_file, "w", encoding="utf-8") as f:
+                json.dump(self.synopses, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
@@ -324,6 +344,44 @@ class VoirAnimeScraper:
 
         return "Saison 1"
 
+    def _extract_synopsis_from_soup(self, soup: BeautifulSoup) -> str:
+        desc_node = (
+            soup.select_one('.description-summary .summary__content')
+            or soup.select_one('.summary__content')
+            or soup.select_one('.description-summary')
+        )
+        if not desc_node:
+            return ""
+        p_tags = desc_node.find_all('p')
+        if p_tags:
+            paragraphs = [p.get_text(strip=True).replace('\xa0', ' ') for p in p_tags if p.get_text(strip=True)]
+            if paragraphs:
+                return "\n\n".join(paragraphs).strip()
+        return desc_node.get_text(separator="\n", strip=True).replace('\xa0', ' ')
+
+    async def _fetch_synopsis(self, anime_url: str, client=None) -> str:
+        if not anime_url:
+            return ""
+        if anime_url in self.synopses and self.synopses[anime_url]:
+            return self.synopses[anime_url]
+
+        http_client, should_close = self._get_active_client(client)
+        try:
+            r = await http_client.get(anime_url)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, 'lxml')
+                synopsis = self._extract_synopsis_from_soup(soup)
+                if synopsis:
+                    self.synopses[anime_url] = synopsis
+                    self.save_synopses()
+                    return synopsis
+        except Exception as e:
+            print(f"Error fetching synopsis for '{anime_url}': {e}")
+        finally:
+            if should_close:
+                await http_client.aclose()
+        return ""
+
     async def _fetch_cover_if_missing(self, anime_name: str, anime_url: str, client=None) -> str:
         if anime_name in self.covers and self.covers[anime_name]:
             return self.covers[anime_name]
@@ -333,6 +391,12 @@ class VoirAnimeScraper:
             r = await http_client.get(anime_url)
             if r.status_code == 200:
                 soup = BeautifulSoup(r.text, 'lxml')
+                if anime_url not in self.synopses:
+                    syn = self._extract_synopsis_from_soup(soup)
+                    if syn:
+                        self.synopses[anime_url] = syn
+                        self.save_synopses()
+
                 og = soup.find('meta', property='og:image')
                 if og and og.get('content'):
                     cover_url = og['content']
@@ -500,10 +564,16 @@ class VoirAnimeScraper:
         elif version_str == "vostfr" and selected.get("_vostfr_url"):
             target_url = selected["_vostfr_url"]
 
+        # Récupération du synopsis depuis la page de l'anime (avec cache)
+        synopsis = await self._fetch_synopsis(target_url, client=self.client)
+        if not synopsis and selected.get("base_url") and selected["base_url"] != target_url:
+            synopsis = await self._fetch_synopsis(selected["base_url"], client=self.client)
+
         return {
             "base_url": selected["base_url"],
             "title": selected["title"],
             "cover": selected["cover"],
+            "synopsis": synopsis,
             "Saison": selected["Saison"],
             "url": target_url
         }
