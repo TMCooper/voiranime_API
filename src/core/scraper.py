@@ -312,24 +312,38 @@ class VoirAnimeScraper:
                 cleaned_to_cover[cleaned] = self.covers.get(orig_name, "")
 
         cleaned_titles = list(cleaned_to_orig.keys())
-        matches = process.extract(cleaned_effective, cleaned_titles, scorer=fuzz.token_set_ratio, limit=20)
+        q_tokens = set(cleaned_effective.split())
+        wants_vf = "vf" in q_tokens or "(vf)" in search.lower()
+        matches = process.extract(cleaned_effective, cleaned_titles, scorer=fuzz.token_set_ratio, limit=100)
 
         temp_results = []
         for cleaned_title, score, _ in matches:
             if score < 60:
                 continue
 
-            length_ratio = len(cleaned_title) / len(cleaned_effective) if len(cleaned_effective) > 0 else 0
-            specificity_bonus = 0
-            if 0.9 <= length_ratio <= 1.1:
-                specificity_bonus = 10
-            elif length_ratio < 0.5:
-                specificity_bonus = -15
+            t_tokens = set(cleaned_title.split())
+            common_tokens = q_tokens & t_tokens
+            query_coverage = (len(common_tokens) / len(q_tokens)) if q_tokens else 0.0
+            title_precision = (len(common_tokens) / len(t_tokens)) if t_tokens else 0.0
 
-            final_score = score + specificity_bonus
+            length_ratio = len(cleaned_title) / len(cleaned_effective) if len(cleaned_effective) > 0 else 0
+            specificity_bonus = 0.0
+            if 0.9 <= length_ratio <= 1.1 and query_coverage >= 0.95:
+                specificity_bonus = 10.0
+            elif length_ratio < 0.5:
+                specificity_bonus = -15.0
+
+            coverage_adjustment = (query_coverage - 1.0) * 20.0 + (title_precision * 3.0)
+
             orig_title = cleaned_to_orig.get(cleaned_title)
             anime_link = cleaned_to_link.get(cleaned_title)
             cover = cleaned_to_cover.get(cleaned_title, "")
+
+            vf_penalty = 0.0
+            if orig_title and not wants_vf and ("(vf)" in orig_title.lower() or (anime_link and "-vf" in anime_link.lower())):
+                vf_penalty = -1.0
+
+            final_score = round(score + specificity_bonus + coverage_adjustment + vf_penalty, 2)
 
             if orig_title and anime_link:
                 temp_results.append({
@@ -346,11 +360,6 @@ class VoirAnimeScraper:
         if not temp_results or (temp_results and temp_results[0]["final_score"] < 75):
             site_items = self.search_site_fallback(search)
             if site_items:
-                top_match = site_items[0]
-                top_root = self._extract_franchise_root(top_match["title"])
-                self.aliases[cleaned_search] = top_root
-                self.save_aliases()
-
                 for item in site_items:
                     orig_title = item["title"]
                     item_link = item["lien"]
@@ -366,6 +375,11 @@ class VoirAnimeScraper:
                         self.catalog[orig_title] = item_link
                 self.save_catalog()
 
+                top_match = site_items[0]
+                top_root, _ = self._resolve_franchise_root(top_match["title"], top_match["lien"])
+                self.aliases[cleaned_search] = top_root
+                self.save_aliases()
+
         temp_results.sort(key=lambda x: x["final_score"], reverse=True)
 
         final_results = []
@@ -380,77 +394,199 @@ class VoirAnimeScraper:
 
         return final_results
 
+    _SEASON_START_KW = re.compile(
+        r'^(?:\d+|ii|iii|iv|v|vi|vii|viii|ix|x|s\d+|season|saison|ova|oav|special|specials|movie|film|'
+        r'the\s+movie|the\s+final|the\s+last|remake|kai|part|stage|extra|plus|ex|new|born|hero|darkness|'
+        r'shippuuden|shippuden|alternative|progressive|final|second|third|fourth|fifth|3d|hd|tv|ona|mini|'
+        r'picture\s+drama|episode|arc|sp|gekijouban|kanketsu|gekitouhen|taidouhen|z|gt|super|daima|'
+        r'stampede|stargaze|next|try|revolution|great|return|gorgeous|premium|excellent|kei|rou|shunmuki|'
+        r'x\s+ut|prologue|omake|lite|wan|churutto|zoku|kan)\b',
+        re.IGNORECASE
+    )
+
+    @staticmethod
+    def _franchise_tokens(text: str) -> list:
+        if not text:
+            return []
+        t = re.sub(r'\(VF\)', '', text, flags=re.IGNORECASE)
+        t = (
+            t.replace('½', ' 1 2 ')
+            .replace('1/2', ' 1 2 ')
+            .replace('²', ' 2 ')
+            .replace('³', ' 3 ')
+            .replace('+', ' plus ')
+            .replace('×', ' x ')
+            .replace('√', ' root ')
+            .replace('∞', ' infinity ')
+        )
+        t = unicodedata.normalize("NFKD", t)
+        t = "".join(c for c in t if not unicodedata.combining(c)).lower()
+        t = re.sub(r'[^a-z0-9\s]', ' ', t)
+        return t.split()
+
+    def _is_franchise_child(self, child_name: str, root_name: str) -> bool:
+        r_no_vf = re.sub(r'\(VF\)', '', root_name, flags=re.IGNORECASE).strip()
+        c_no_vf = re.sub(r'\(VF\)', '', child_name, flags=re.IGNORECASE).strip()
+        if not r_no_vf or not c_no_vf:
+            return False
+        if r_no_vf.startswith('_') and not c_no_vf.startswith('_'):
+            return False
+
+        rt = self._franchise_tokens(r_no_vf)
+        ct = self._franchise_tokens(c_no_vf)
+        if not rt or not ct or len(ct) < len(rt):
+            return False
+        if ct == rt:
+            return True
+
+        # 1. Préfixe direct par tokens entiers
+        if ct[:len(rt)] == rt:
+            rem = ct[len(rt):]
+            rem_str = " ".join(rem)
+            has_sep = bool(re.match(r'^' + re.escape(r_no_vf) + r'\s*[:\-–—\(!\?\.\/☆△]', c_no_vf, re.IGNORECASE))
+            if len(rt) >= 3:
+                return True
+            if len(rt) == 2:
+                if rt == ['high', 'score'] and rem[0] == 'girl':
+                    return False
+                if not has_sep and rem[0] in {'of', 'in', 'to', 'for', 'with', 'on', 'at', 'from', 'by', 'no', 'wa', 'ga', 'wo', 'ni'}:
+                    return False
+                return True
+            # len(rt) == 1 : exiger un séparateur explicite ou un mot-clé de saison/suite/OAV/film
+            if has_sep or self._SEASON_START_KW.match(rem_str):
+                return True
+            return False
+
+        # 2. Spin-offs / suites avec préfixe connu devant la racine (ex: Motto To Love-Ru, Zoku ..., Boruto: Naruto ...)
+        if len(rt) >= 2 or rt == ['naruto']:
+            for idx in range(1, len(ct) - len(rt) + 1):
+                if ct[idx:idx + len(rt)] == rt:
+                    pref = " ".join(ct[:idx])
+                    if pref in {'motto', 'zoku', 'zan', 'shin', 'new', 'super', 'the first', 'gekijouban', 'eiga', 'demon slayer', 'boruto', 'the last'}:
+                        return True
+                    pos = c_no_vf.lower().find(r_no_vf.lower())
+                    if len(rt) >= 3 and pos > 0 and ':' in c_no_vf[:pos]:
+                        return True
+
+        return False
+
+    def _resolve_franchise_root(self, title: str, url: str = "") -> tuple[str, str]:
+        cand = re.sub(r'\(VF\)', '', title or '', flags=re.IGNORECASE).strip()
+        if not cand:
+            return title, url
+
+        regex_root = self._extract_franchise_root(cand)
+        parents = []
+
+        for cat_name, cat_url in self.catalog.items():
+            is_vf = bool(re.search(r'\(VF\)', cat_name, re.IGNORECASE) or "-vf" in cat_url.lower())
+            if is_vf:
+                continue
+            if self._is_franchise_child(cand, cat_name) or (regex_root and self._is_franchise_child(regex_root, cat_name)):
+                parents.append((len(self._franchise_tokens(cat_name)), len(cat_name), cat_name, cat_url))
+
+        if parents:
+            parents.sort(key=lambda x: (x[0], x[1]))
+            return parents[0][2], parents[0][3]
+
+        # Fallback si seules des entrées VF ou secondaires existent dans le catalogue
+        if regex_root and regex_root != cand:
+            for cat_name, cat_url in self.catalog.items():
+                if cat_name != title and self._is_franchise_child(cat_name, regex_root):
+                    return regex_root, url
+
+        return cand, url
+
+    @staticmethod
+    def _strip_root_prefix(clean_name_no_vf: str, root_name: str) -> str:
+        if not root_name:
+            return clean_name_no_vf
+        r_esc = re.escape(root_name.strip())
+        r_pat = (
+            r_esc.replace(r'\ ', r'[\s:\-–—\.\!☆△\/]*')
+            .replace('½', '(?:½|1/2)')
+            .replace(r'1\/2', '(?:½|1/2)')
+        )
+        m = re.match(r'^' + r_pat + r'[\s:\-–—\.\!☆△]*', clean_name_no_vf, flags=re.IGNORECASE)
+        if m and m.end() < len(clean_name_no_vf):
+            sub = clean_name_no_vf[m.end():].strip(" -:–—")
+            if sub:
+                return sub
+        return clean_name_no_vf
+
     def _extract_franchise_root(self, title: str) -> str:
         # Nettoie les suffixes de saison, de langue ou de type pour identifier la franchise
         t = re.sub(r'\(VF\)', '', title, flags=re.IGNORECASE)
         t = re.sub(r'\(\d{4}\)', '', t) # enlever les années comme (2024)
-        t = re.sub(r'\b(?:S\d+|Season\s*\d+|Saison\s*\d+)\b', '', t, flags=re.IGNORECASE)
-        t = re.sub(r'\b(?:Movie|Film|OVA|OAV|Special|Specials|Remake)\b.*', '', t, flags=re.IGNORECASE)
+        t = re.sub(r'\b(?:S\d+|Season\s*\d+|Saison\s*\d+|\d+(?:nd|rd|th|st)\s*Season)\b.*', '', t, flags=re.IGNORECASE)
+        t = re.sub(r'\b(?:The\s+Movie|Movie|Film|OVA|OAV|Special|Specials|Remake)\b.*', '', t, flags=re.IGNORECASE)
         t = re.sub(r'\b(X|IX|VIII|VII|VI|V|IV|III|II|I)\b\s*$', '', t, flags=re.IGNORECASE)
         t = re.sub(r'\s+\d+$', '', t) # trailing number like "Frieren 2"
         return t.strip(" -_:")
 
     def _parse_season_label(self, clean_name_no_vf: str, root_name: str = "") -> str:
-        # 1. Film / Movie
-        if re.search(r'\b(?:Movie|Film)\b', clean_name_no_vf, re.IGNORECASE):
-            m_num = re.search(r'\b(?:Movie|Film)\s*(\d+)\b', clean_name_no_vf, re.IGNORECASE)
-            return f"Film {m_num.group(1)}" if m_num else "Film"
+        sub = self._strip_root_prefix(clean_name_no_vf, root_name) if root_name else clean_name_no_vf
+        sub_clean = sub.strip(" -:–—")
+        if not sub_clean or (root_name and self._franchise_tokens(clean_name_no_vf) == self._franchise_tokens(root_name)):
+            return "Saison 1"
 
-        # 2. OAV / OVA / Special
-        if re.search(r'\b(?:OVA|OAV|Special|Specials)\b', clean_name_no_vf, re.IGNORECASE):
-            return "OAV"
+        # 1. Année ou Remake (ex: "(2024)", "(2024) S2", "Remake 2024")
+        m_rem_s = re.fullmatch(r'(?:remake\s*)?\(?(\d{4})\)?\s*(?:S|Saison|Season)\s*(\d+)', sub_clean, re.IGNORECASE)
+        if m_rem_s:
+            return f"Remake {m_rem_s.group(1)} Saison {m_rem_s.group(2)}"
 
-        # 3. Année ou Remake (ex: Ookami to Koushinryou (2024))
-        year_match = re.search(r'\((\d{4})\)', clean_name_no_vf)
-        if year_match:
-            return f"Remake {year_match.group(1)}"
+        m_rem = re.fullmatch(r'(?:remake\s*)?\(?(\d{4})\)?(?:\s*remake)?', sub_clean, re.IGNORECASE)
+        if m_rem:
+            return f"Remake {m_rem.group(1)}"
 
-        if re.search(r'\bremake\b', clean_name_no_vf, re.IGNORECASE):
-            m_yr = re.search(r'\bremake\s*(\d{4})?\b', clean_name_no_vf, re.IGNORECASE)
-            return f"Remake {m_yr.group(1)}" if m_yr and m_yr.group(1) else "Remake"
+        if re.fullmatch(r'remake', sub_clean, re.IGNORECASE):
+            return "Remake"
 
-        # 4. Numéro de saison explicite (S1, Saison 2...)
-        season_match = re.search(r'\b(?:S|Saison|Season)\s*(\d+)\b', clean_name_no_vf, re.IGNORECASE)
-        if season_match:
-            return f"Saison {season_match.group(1)}"
+        # 2. Numéro de saison pur (ex: "2", "S2", "Season 2", "Saison 2", "2nd Season", "II", "III")
+        m_s_pure = re.fullmatch(
+            r'(?:(?:S|Saison|Season)\s*(\d{1,2})|(\d{1,2})\s*(?:nd|rd|th|st)\s*Season|(\d{1,2}))',
+            sub_clean,
+            re.IGNORECASE
+        )
+        if m_s_pure:
+            num = m_s_pure.group(1) or m_s_pure.group(2) or m_s_pure.group(3)
+            return f"Saison {int(num)}"
 
-        # 5. Chiffre romain en fin de nom (ex: Ookami to Koushinryou II)
-        roman_match = re.search(r'\b(X|IX|VIII|VII|VI|V|IV|III|II|I)\b\s*$', clean_name_no_vf, re.IGNORECASE)
-        if roman_match:
-            rom = roman_match.group(1).lower()
+        m_rom_pure = re.fullmatch(r'(?:(?:S|Saison|Season)\s*)?(X|IX|VIII|VII|VI|V|IV|III|II)', sub_clean, re.IGNORECASE)
+        if m_rom_pure:
+            rom = m_rom_pure.group(1).lower()
             if rom in self.ROMAN_TO_INT and self.ROMAN_TO_INT[rom] > 1:
                 return f"Saison {self.ROMAN_TO_INT[rom]}"
 
-        # 6. Suites connues courantes (Shippuuden = Saison 2, Sennen Kessen-hen = Saison 2)
-        lower_name = clean_name_no_vf.lower()
-        if "shippuuden" in lower_name or "shippuden" in lower_name:
+        # 3. OAV / OVA / Special pur (ex: "OVA", "OAV", "OVA 2", "Special", "Specials")
+        m_ova_pure = re.fullmatch(r'\(?(?:OVA|OAV)\)?(?:\s*0*(\d+))?', sub_clean, re.IGNORECASE)
+        if m_ova_pure:
+            return f"OAV {int(m_ova_pure.group(1))}" if m_ova_pure.group(1) else "OAV"
+
+        m_spec_pure = re.fullmatch(r'\(?(?:Special|Specials)\)?(?:\s*0*(\d+))?', sub_clean, re.IGNORECASE)
+        if m_spec_pure:
+            return f"OAV {int(m_spec_pure.group(1))}" if m_spec_pure.group(1) else "OAV"
+
+        # 4. Film / Movie pur ou préfixé (ex: "Movie", "Movie 1", "Movie: Ordinal Scale", "THE MOVIE: Futari no Hero")
+        m_film_pure = re.fullmatch(r'\(?(?:The\s+)?(?:Movie|Film)\)?(?:\s*0*(\d+))?', sub_clean, re.IGNORECASE)
+        if m_film_pure:
+            return f"Film {int(m_film_pure.group(1))}" if m_film_pure.group(1) else "Film"
+
+        m_film_sub = re.match(r'^\(?(?:The\s+)?(?:Movie|Film)\)?(?:\s*0*(\d+))?\s*[:\-–—]+\s*(.+)$', sub_clean, re.IGNORECASE)
+        if m_film_sub:
+            f_num = f" {int(m_film_sub.group(1))}" if m_film_sub.group(1) else ""
+            f_sub = m_film_sub.group(2).strip(" -:–—")
+            return f"Film{f_num}: {f_sub}" if f_sub else f"Film{f_num}"
+
+        # 5. Suites connues exactes (Shippuuden = Saison 2, Sennen Kessen-hen = Saison 2, Kai = Kai)
+        lower_sub = sub_clean.lower()
+        if lower_sub in ("shippuuden", "shippuden", "sennen kessen-hen"):
             return "Saison 2"
-        if "sennen kessen-hen" in lower_name:
-            return "Saison 2"
-        if "kai" in lower_name:
+        if lower_sub == "kai":
             return "Kai"
-        if "boruto" in lower_name:
-            return "Boruto"
 
-        # 7. Films connus sans le mot "Movie" / "Film" explicite
-        if any(f in lower_name for f in ["diamonddust", "memories of nobody", "jigoku-hen", "fade to black", "the last", "blood prison", "kizuna"]):
-            return "Film"
-
-        # 8. Nombre simple en fin de titre (ex: Sousou no Frieren 2)
-        num_match = re.search(r'\s+(\d+)$', clean_name_no_vf)
-        if num_match:
-            return f"Saison {num_match.group(1)}"
-
-        # 9. Sous-titre si différent du root
-        if root_name:
-            c_root = self.clean_string(root_name)
-            c_curr = self.clean_string(clean_name_no_vf)
-            if c_curr != c_root:
-                sub = re.sub(r'^' + re.escape(root_name), '', clean_name_no_vf, flags=re.IGNORECASE).strip(" -:—")
-                if sub:
-                    return sub
-
-        return "Saison 1"
+        # 6. Conserver le sous-titre / nom de saison exact (ex: "New", "BorN", "New OVA Oppai, Tsutsumimasu!")
+        return sub_clean
 
     def _extract_synopsis_from_soup(self, soup: BeautifulSoup) -> str:
         desc_node = (
@@ -552,53 +688,88 @@ class VoirAnimeScraper:
             return []
 
         best_match = search_results[0]
-        base_title = best_match["title"]
-        base_url = best_match["lien"]
-        root_name = self._extract_franchise_root(base_title)
+        matched_title = best_match["title"]
+        matched_url = best_match["lien"]
+        root_name, root_url = self._resolve_franchise_root(matched_title, matched_url)
         if not root_name:
-            root_name = base_title
+            root_name = matched_title
+        base_url = root_url or matched_url
 
-        # Trouver tous les animes du catalogue appartenant à cette même franchise
-        root_clean = self.clean_string(root_name)
+        # Trouver tous les animes du catalogue appartenant à cette même franchise (sans faux positifs)
+        root_tokens = self._franchise_tokens(root_name)
         franchise_entries = []
 
         for name, link in self.catalog.items():
-            name_clean = self.clean_string(name)
-            if root_clean in name_clean:
+            if self._is_franchise_child(name, root_name):
                 franchise_entries.append((name, link))
 
         if not franchise_entries:
-            franchise_entries = [(base_title, base_url)]
+            franchise_entries = [(matched_title, matched_url)]
 
-        cover, synopsis = await self._fetch_metadata_if_missing(base_title, base_url, client=self.client)
+        # Trier pour traiter d'abord la racine, puis les VOSTFR avant les VF
+        def _entry_order(item):
+            n, l = item
+            is_vf_flag = bool(re.search(r'\(VF\)', n, re.IGNORECASE) or "-vf" in l.lower())
+            no_vf = re.sub(r'\(VF\)', '', n, flags=re.IGNORECASE).strip()
+            is_root_flag = (self._franchise_tokens(no_vf) == root_tokens)
+            return (0 if is_root_flag else 1, 1 if is_vf_flag else 0, len(no_vf), n.lower())
 
-        # Classifier en saisons / films / OAVs / Remakes
-        base_clean = self.clean_string(base_title)
+        franchise_entries.sort(key=_entry_order)
+
+        cover, synopsis = await self._fetch_metadata_if_missing(root_name, base_url, client=self.client)
+
+        # Classifier en saisons / films / OAVs / Remakes sans jamais écraser une entrée existante distincte
         seasons_map = {
-            "Saison 1": {"vostfr": base_url, "vf": None, "url": base_url}
+            "Saison 1": {"vostfr": base_url, "vf": None, "url": base_url, "_title": root_name}
         }
 
         for name, link in franchise_entries:
             is_vf = bool(re.search(r'\(VF\)', name, re.IGNORECASE) or "-vf" in link.lower())
             clean_name_no_vf = re.sub(r'\(VF\)', '', name, flags=re.IGNORECASE).strip()
-            name_clean = self.clean_string(clean_name_no_vf)
+            cand_tokens = self._franchise_tokens(clean_name_no_vf)
 
-            is_root = (name_clean == root_clean or name_clean == base_clean or link.rstrip('/') == base_url.rstrip('/'))
+            is_root = (cand_tokens == root_tokens or link.rstrip('/') == base_url.rstrip('/'))
             if is_root:
                 season_label = "Saison 1"
             else:
                 season_label = self._parse_season_label(clean_name_no_vf, root_name=root_name)
                 # Ne jamais laisser un titre secondaire écraser Saison 1
                 if season_label == "Saison 1":
-                    sub = re.sub(r'^' + re.escape(root_name), '', clean_name_no_vf, flags=re.IGNORECASE).strip(" -:—")
-                    season_label = sub if sub else f"Autre ({clean_name_no_vf})"
+                    sub = self._strip_root_prefix(clean_name_no_vf, root_name).strip(" -:–—")
+                    season_label = sub if (sub and sub != clean_name_no_vf) else f"Autre ({clean_name_no_vf})"
+
+            if is_vf and not is_root:
+                # Associer la VF à son homologue VOSTFR exact s'il existe déjà dans seasons_map
+                matched_existing_label = None
+                for existing_lbl, existing_data in seasons_map.items():
+                    if existing_data.get("_title") and self._franchise_tokens(existing_data["_title"]) == cand_tokens:
+                        matched_existing_label = existing_lbl
+                        break
+                if matched_existing_label:
+                    season_label = matched_existing_label
+                elif season_label in seasons_map and seasons_map[season_label]["vf"] and seasons_map[season_label]["vf"].rstrip('/') != link.rstrip('/'):
+                    raw_sub = self._strip_root_prefix(clean_name_no_vf, root_name).strip(" -:–—")
+                    if raw_sub and raw_sub != season_label and (raw_sub not in seasons_map or not seasons_map[raw_sub]["vf"]):
+                        season_label = raw_sub
+                    else:
+                        idx_dup = 2
+                        while f"{season_label} ({idx_dup})" in seasons_map and seasons_map[f"{season_label} ({idx_dup})"]["vf"]:
+                            idx_dup += 1
+                        season_label = f"{season_label} ({idx_dup})"
+            elif not is_vf and not is_root:
+                # Empêcher deux entrées VOSTFR distinctes (ex: OVA et Specials, ou New OVA) de s'écraser
+                if season_label in seasons_map and seasons_map[season_label]["vostfr"] and seasons_map[season_label]["vostfr"].rstrip('/') != link.rstrip('/'):
+                    raw_sub = self._strip_root_prefix(clean_name_no_vf, root_name).strip(" -:–—")
+                    if raw_sub and raw_sub != season_label and (raw_sub not in seasons_map or not seasons_map[raw_sub]["vostfr"]):
+                        season_label = raw_sub
+                    else:
+                        idx_dup = 2
+                        while f"{season_label} ({idx_dup})" in seasons_map and seasons_map[f"{season_label} ({idx_dup})"]["vostfr"]:
+                            idx_dup += 1
+                        season_label = f"{season_label} ({idx_dup})"
 
             if season_label not in seasons_map:
-                seasons_map[season_label] = {"vostfr": None, "vf": None, "url": link}
-
-            # Si c'est Saison 1 mais que ce n'est PAS la racine, on n'écrase pas
-            if season_label == "Saison 1" and not is_root and seasons_map["Saison 1"]["vostfr"]:
-                continue
+                seasons_map[season_label] = {"vostfr": None, "vf": None, "url": link, "_title": clean_name_no_vf}
 
             if is_vf:
                 seasons_map[season_label]["vf"] = link
@@ -607,6 +778,7 @@ class VoirAnimeScraper:
             else:
                 seasons_map[season_label]["vostfr"] = link
                 seasons_map[season_label]["url"] = link
+                seasons_map[season_label]["_title"] = clean_name_no_vf
 
         # Construire la liste finale
         result = []
@@ -623,19 +795,19 @@ class VoirAnimeScraper:
                 "_vf_url": urls["vf"]
             })
 
-        # Trier Saison 1, Saison 2, Remake ..., Film, OAV
+        # Trier Saison 1, Saison 2, Remake ..., Film, OAV, puis sous-titres
         def sort_key(item):
             s = item["Saison"]
             m = re.search(r'\d+', s)
-            if "Saison" in s and m:
-                return (0, int(m.group()))
+            if s.startswith("Saison") and m:
+                return (0, int(m.group()), s)
             if "Remake" in s:
-                return (0, 99)
-            if "Film" in s:
-                return (1, 0)
-            if "OAV" in s:
-                return (2, 0)
-            return (3, 0)
+                return (0, 99, s)
+            if s.startswith("Film"):
+                return (1, int(m.group()) if m else 0, s)
+            if s.startswith("OAV") or s.lower() == "specials":
+                return (2, int(m.group()) if m else 0, s)
+            return (3, 0, s)
 
         result.sort(key=sort_key)
         return result
@@ -658,29 +830,69 @@ class VoirAnimeScraper:
 
         selected = None
 
-        # 1. Match si "remake" ou année demandée (ex: "remake2024", "2024")
-        if "remake" in saison_str or (target_s_num and len(target_s_num) == 4):
+        # 0. Si la requête cible directement un OAV/saison/film spécifique et que 'saison' est laissé par défaut ('saison1')
+        if saison_str in ("saison1", "s1", ""):
+            direct_matches = self.serch_anime(query, limit=1)
+            if direct_matches:
+                dm_title = direct_matches[0]["title"]
+                dm_url = direct_matches[0]["lien"].rstrip("/")
+                dm_tokens = self._franchise_tokens(dm_title)
+                root_tokens = self._franchise_tokens(seasons[0]["title"])
+                if dm_tokens != root_tokens:
+                    for item in seasons:
+                        candidates_urls = [
+                            (item.get("url") or "").rstrip("/"),
+                            (item.get("_vostfr_url") or "").rstrip("/"),
+                            (item.get("_vf_url") or "").rstrip("/"),
+                        ]
+                        if dm_url in candidates_urls:
+                            selected = item
+                            break
+
+        # 1. Match exact prioritaire (insensible à la casse, aux espaces et à la ponctuation)
+        if not selected:
+            saison_tokens = self._franchise_tokens(saison or "saison1")
+            for item in seasons:
+                s_item = item["Saison"].lower().replace(" ", "")
+                if saison_str == s_item or (saison_tokens and saison_tokens == self._franchise_tokens(item["Saison"])):
+                    selected = item
+                    break
+
+        # 2. Match si "remake" ou année demandée (ex: "remake2024", "2024")
+        if not selected and ("remake" in saison_str or (target_s_num and len(target_s_num) == 4)):
             for item in seasons:
                 s_item = item["Saison"].lower().replace(" ", "")
                 if "remake" in s_item or (target_s_num and target_s_num in s_item):
                     selected = item
                     break
 
-        # 2. Match exact ou substring (ex: "saison2" == "saison2")
-        if not selected:
+        # 3. Match par numéro de saison (ex: "saison2" ou "s2" dans "Saison 2")
+        if not selected and target_s_num and ("saison" in saison_str or re.fullmatch(r's\d+', saison_str)):
             for item in seasons:
                 s_item = item["Saison"].lower().replace(" ", "")
-                if saison_str == s_item or saison_str in s_item or s_item in saison_str:
+                if s_item == f"saison{target_s_num}" or s_item == f"s{target_s_num}":
                     selected = item
                     break
 
-        # 3. Match par numéro de saison (ex: "saison2" dans "Saison 2")
-        if not selected and target_s_num:
+        # 4. Match partiel intelligent (en privilégiant la correspondance la plus spécifique/longue)
+        if not selected:
+            norm_target = saison_str.replace("ova", "oav").replace("movie", "film")
+            best_partial = None
+            best_partial_len = -1
             for item in seasons:
                 s_item = item["Saison"].lower().replace(" ", "")
-                if f"saison{target_s_num}" in s_item or f"s{target_s_num}" in s_item:
-                    selected = item
-                    break
+                norm_item = s_item.replace("ova", "oav").replace("movie", "film")
+                if norm_target in norm_item:
+                    # Privilégier l'item dont la longueur est la plus proche de la cible
+                    score_len = 1000 - abs(len(norm_item) - len(norm_target))
+                    if score_len > best_partial_len:
+                        best_partial_len = score_len
+                        best_partial = item
+                elif norm_item in norm_target and len(norm_item) > best_partial_len:
+                    best_partial_len = len(norm_item)
+                    best_partial = item
+            if best_partial:
+                selected = best_partial
 
         # 4. Fallback par index ordinal (ex: saison3 alors que la 3ème saison s'appelle Remake 2024)
         if not selected and target_s_num and target_s_num.isdigit():
