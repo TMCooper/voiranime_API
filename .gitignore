@@ -5,3 +5,6 @@ __pycache__
 data
 downloaded_files
 .pytest_cache
+scratch*
+unpacked*
+scripts
