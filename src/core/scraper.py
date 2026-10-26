@@ -744,12 +744,20 @@ class VoirAnimeScraper:
         http_client, should_close = self._get_active_client()
         sem = asyncio.Semaphore(10)
         cf_blocked = False
+        cache_dirty = False
 
         async def resolve_one(ep_num, ep_data):
-            nonlocal cf_blocked
-            # 1. Vérifier si le flux direct ou le lecteur est déjà en cache
+            nonlocal cf_blocked, cache_dirty
+            # 1. Vérifier si le flux direct ou le lecteur est déjà en cache (et le rafraîchir si expiré / autre IP-ASN)
             if ep_data["url"] in self.streams_cache and self.streams_cache[ep_data["url"]]:
                 c = self.streams_cache[ep_data["url"]]
+                old_stream = c.get("stream_url") if isinstance(c, dict) else c
+                if self.resolver.is_stream_expired_or_invalid(old_stream):
+                    async with sem:
+                        c = await self._ensure_fresh_stream(
+                            ep_data["url"], c, client=http_client, save_cache=False
+                        )
+                        cache_dirty = True
                 stream = c.get("stream_url") or c.get("iframe_url") if isinstance(c, dict) else c
                 if stream:
                     return {"episode": ep_num, "url": stream}
@@ -775,6 +783,9 @@ class VoirAnimeScraper:
 
         tasks = [resolve_one(num, ep) for num, ep in episodes_with_num]
         results = await asyncio.gather(*tasks)
+
+        if cache_dirty:
+            self.save_streams_cache()
 
         if should_close:
             await http_client.aclose()
@@ -922,9 +933,75 @@ class VoirAnimeScraper:
             if should_close:
                 await http_client.aclose()
 
+    async def _ensure_fresh_stream(self, episode_url: str, cached_entry, client=None, save_cache=True):
+        """
+        Vérifie si une entrée de self.streams_cache est toujours valide pour l'IP/ASN courant
+        et non expirée. Si elle est expirée, liée à un autre ASN, sur vmbox.space,
+        ou encore sous forme d'embed (ex: ansembed/voembed), la résout à la volée.
+        """
+        if isinstance(cached_entry, dict):
+            stream_url = cached_entry.get("stream_url")
+            iframe_url = cached_entry.get("iframe_url") or stream_url
+            host = cached_entry.get("host") or "voembed"
+            stream_type = cached_entry.get("stream_type") or "hls"
+        else:
+            stream_url = str(cached_entry)
+            iframe_url = stream_url
+            host = "voembed"
+            stream_type = "hls"
+
+        if not self.resolver.is_stream_expired_or_invalid(stream_url):
+            return cached_entry if isinstance(cached_entry, dict) else {
+                "iframe_url": iframe_url,
+                "stream_url": stream_url,
+                "stream_type": stream_type,
+                "host": host,
+            }
+
+        http_client, should_close = self._get_active_client(client)
+        try:
+            target_to_resolve = (
+                iframe_url if (iframe_url and "embed-" in iframe_url) else (stream_url or iframe_url)
+            )
+            resolved = await self.resolver.resolve(target_to_resolve, client=http_client)
+            if resolved.get("status") == "success" and resolved.get("stream_url"):
+                vid_id = self.resolver.extract_vm_video_id(target_to_resolve)
+                clean_iframe = (
+                    iframe_url
+                    if (iframe_url and "embed-" in iframe_url)
+                    else (f"https://voembed.net/embed-{vid_id}.html" if vid_id else resolved.get("embed_url", iframe_url))
+                )
+                updated = {
+                    "iframe_url": clean_iframe,
+                    "stream_url": resolved["stream_url"],
+                    "stream_type": resolved.get("type", "hls"),
+                    "host": resolved.get("host") or host,
+                }
+                self.streams_cache[episode_url] = updated
+                if save_cache:
+                    self.save_streams_cache()
+                return updated
+        except Exception:
+            pass
+        finally:
+            if should_close:
+                await http_client.aclose()
+
+        return cached_entry if isinstance(cached_entry, dict) else {
+            "iframe_url": iframe_url,
+            "stream_url": stream_url,
+            "stream_type": stream_type,
+            "host": host,
+        }
+
     async def fetch_download_link(self, episode_url: str, client=None, resolve_stream=True):
         if episode_url in self.streams_cache and self.streams_cache[episode_url]:
-            return self.streams_cache[episode_url]
+            if not resolve_stream:
+                c = self.streams_cache[episode_url]
+                return c.get("iframe_url") or c.get("stream_url") if isinstance(c, dict) else c
+            return await self._ensure_fresh_stream(
+                episode_url, self.streams_cache[episode_url], client=client, save_cache=True
+            )
 
         http_client, should_close = self._get_active_client(client)
         try:
@@ -947,7 +1024,7 @@ class VoirAnimeScraper:
                     def source_priority(key):
                         k = key.lower()
                         if "sibnet" in k: return 999
-                        if "mytv" in k or "voembed" in k: return 0
+                        if "mytv" in k or "voembed" in k or "ansembed" in k: return 0
                         if "vidmoly" in k: return 1
                         if "sendvid" in k: return 2
                         if "vidoza" in k: return 3
