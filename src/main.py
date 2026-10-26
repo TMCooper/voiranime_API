@@ -322,3 +322,29 @@ async def get_single_download_link(
         "stream_type": resolved_info.get("stream_type") if isinstance(resolved_info, dict) else None,
         "host": resolved_info.get("host") if isinstance(resolved_info, dict) else None
     }
+
+@app.get("/api/setCookie", tags=["Cloudflare Bypass"])
+@app.post("/api/setCookie", tags=["Cloudflare Bypass"])
+async def set_cookie_endpoint(cookie: Optional[str] = Query(None, description="Valeur du cookie cf_clearance ou chaîne brute")):
+    """
+    Configure dynamiquement les cookies Cloudflare (notamment cf_clearance) pour contourner le challenge Turnstile.
+    """
+    if not cookie:
+        raise HTTPException(status_code=400, detail="Paramètre 'cookie' manquant.")
+    scraper.set_cookies(cookie)
+    return {
+        "status": "success",
+        "message": "Cookies mis a jour avec succes.",
+        "cookies": list(scraper.cookies.keys())
+    }
+
+@app.get("/api/getCookieStatus", tags=["Cloudflare Bypass"])
+async def get_cookie_status():
+    """
+    Vérifie si un cookie Cloudflare (ex: cf_clearance) est configuré dans l'API.
+    """
+    return {
+        "has_cf_clearance": "cf_clearance" in scraper.cookies,
+        "configured_cookies": list(scraper.cookies.keys())
+    }
+

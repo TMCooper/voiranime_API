@@ -18,10 +18,14 @@ class VoirAnimeScraper:
         self.covers_file = os.path.join(self.data_dir, "covers.json")
         self.aliases_file = os.path.join(self.data_dir, "aliases.json")
         self.synopses_file = os.path.join(self.data_dir, "synopses.json")
+        self.cookies_file = os.path.join(self.data_dir, "cookies.json")
+        self.episodes_cache_file = os.path.join(self.data_dir, "episodes_cache.json")
+        self.streams_cache_file = os.path.join(self.data_dir, "streams_cache.json")
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://voir-anime.to/"
         }
         self.ROMAN_TO_INT = {
             'i': 1, 'ii': 2, 'iii': 3, 'iv': 4, 'v': 5,
@@ -40,6 +44,11 @@ class VoirAnimeScraper:
         self.covers = self.load_covers()
         self.aliases = self.load_aliases()
         self.synopses = self.load_synopses()
+        self.cookies = self.load_cookies()
+        self.episodes_cache = self.load_episodes_cache()
+        self.streams_cache = self.load_streams_cache()
+        if self.cookies:
+            self.headers["Cookie"] = "; ".join([f"{k}={v}" for k, v in self.cookies.items()])
         self.client = None
         self.resolver = StreamResolver(headers=self.headers)
 
@@ -47,6 +56,7 @@ class VoirAnimeScraper:
         if self.client is None or self.client.is_closed:
             self.client = httpx.AsyncClient(
                 headers=self.headers,
+                cookies=self.cookies or None,
                 timeout=12.0,
                 follow_redirects=True,
                 limits=httpx.Limits(max_connections=30, max_keepalive_connections=15)
@@ -64,6 +74,7 @@ class VoirAnimeScraper:
             return self.client, False
         return httpx.AsyncClient(
             headers=self.headers,
+            cookies=self.cookies or None,
             timeout=12.0,
             follow_redirects=True,
             limits=httpx.Limits(max_connections=30, max_keepalive_connections=15)
@@ -137,6 +148,79 @@ class VoirAnimeScraper:
         try:
             with open(self.synopses_file, "w", encoding="utf-8") as f:
                 json.dump(self.synopses, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def load_cookies(self):
+        if os.path.exists(self.cookies_file):
+            try:
+                with open(self.cookies_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+                    elif isinstance(data, str):
+                        c_dict = {}
+                        for part in data.split(";"):
+                            if "=" in part:
+                                k, v = part.strip().split("=", 1)
+                                c_dict[k.strip()] = v.strip()
+                        return c_dict
+            except Exception:
+                pass
+        return {}
+
+    def save_cookies(self, cookies=None):
+        if cookies is not None:
+            self.cookies = cookies
+        try:
+            with open(self.cookies_file, "w", encoding="utf-8") as f:
+                json.dump(self.cookies, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def set_cookies(self, cookie_data):
+        if isinstance(cookie_data, str):
+            c_dict = {}
+            for part in cookie_data.split(";"):
+                if "=" in part:
+                    k, v = part.strip().split("=", 1)
+                    c_dict[k.strip()] = v.strip()
+            self.cookies = c_dict
+        elif isinstance(cookie_data, dict):
+            self.cookies = cookie_data
+        if self.cookies:
+            self.headers["Cookie"] = "; ".join([f"{k}={v}" for k, v in self.cookies.items()])
+        self.save_cookies()
+
+    def load_episodes_cache(self):
+        if os.path.exists(self.episodes_cache_file):
+            try:
+                with open(self.episodes_cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def save_episodes_cache(self):
+        try:
+            with open(self.episodes_cache_file, "w", encoding="utf-8") as f:
+                json.dump(self.episodes_cache, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def load_streams_cache(self):
+        if os.path.exists(self.streams_cache_file):
+            try:
+                with open(self.streams_cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def save_streams_cache(self):
+        try:
+            with open(self.streams_cache_file, "w", encoding="utf-8") as f:
+                json.dump(self.streams_cache, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
@@ -306,7 +390,7 @@ class VoirAnimeScraper:
         t = re.sub(r'\s+\d+$', '', t) # trailing number like "Frieren 2"
         return t.strip(" -_:")
 
-    def _parse_season_label(self, clean_name_no_vf: str) -> str:
+    def _parse_season_label(self, clean_name_no_vf: str, root_name: str = "") -> str:
         # 1. Film / Movie
         if re.search(r'\b(?:Movie|Film)\b', clean_name_no_vf, re.IGNORECASE):
             m_num = re.search(r'\b(?:Movie|Film)\s*(\d+)\b', clean_name_no_vf, re.IGNORECASE)
@@ -337,10 +421,34 @@ class VoirAnimeScraper:
             if rom in self.ROMAN_TO_INT and self.ROMAN_TO_INT[rom] > 1:
                 return f"Saison {self.ROMAN_TO_INT[rom]}"
 
-        # 6. Nombre simple en fin de titre (ex: Sousou no Frieren 2)
+        # 6. Suites connues courantes (Shippuuden = Saison 2, Sennen Kessen-hen = Saison 2)
+        lower_name = clean_name_no_vf.lower()
+        if "shippuuden" in lower_name or "shippuden" in lower_name:
+            return "Saison 2"
+        if "sennen kessen-hen" in lower_name:
+            return "Saison 2"
+        if "kai" in lower_name:
+            return "Kai"
+        if "boruto" in lower_name:
+            return "Boruto"
+
+        # 7. Films connus sans le mot "Movie" / "Film" explicite
+        if any(f in lower_name for f in ["diamonddust", "memories of nobody", "jigoku-hen", "fade to black", "the last", "blood prison", "kizuna"]):
+            return "Film"
+
+        # 8. Nombre simple en fin de titre (ex: Sousou no Frieren 2)
         num_match = re.search(r'\s+(\d+)$', clean_name_no_vf)
         if num_match:
             return f"Saison {num_match.group(1)}"
+
+        # 9. Sous-titre si différent du root
+        if root_name:
+            c_root = self.clean_string(root_name)
+            c_curr = self.clean_string(clean_name_no_vf)
+            if c_curr != c_root:
+                sub = re.sub(r'^' + re.escape(root_name), '', clean_name_no_vf, flags=re.IGNORECASE).strip(" -:—")
+                if sub:
+                    return sub
 
         return "Saison 1"
 
@@ -465,18 +573,37 @@ class VoirAnimeScraper:
         cover, synopsis = await self._fetch_metadata_if_missing(base_title, base_url, client=self.client)
 
         # Classifier en saisons / films / OAVs / Remakes
-        seasons_map = {} # label -> {"vostfr": url, "vf": url, "main_url": url}
+        base_clean = self.clean_string(base_title)
+        seasons_map = {
+            "Saison 1": {"vostfr": base_url, "vf": None, "url": base_url}
+        }
 
         for name, link in franchise_entries:
             is_vf = bool(re.search(r'\(VF\)', name, re.IGNORECASE) or "-vf" in link.lower())
             clean_name_no_vf = re.sub(r'\(VF\)', '', name, flags=re.IGNORECASE).strip()
-            season_label = self._parse_season_label(clean_name_no_vf)
+            name_clean = self.clean_string(clean_name_no_vf)
+
+            is_root = (name_clean == root_clean or name_clean == base_clean or link.rstrip('/') == base_url.rstrip('/'))
+            if is_root:
+                season_label = "Saison 1"
+            else:
+                season_label = self._parse_season_label(clean_name_no_vf, root_name=root_name)
+                # Ne jamais laisser un titre secondaire écraser Saison 1
+                if season_label == "Saison 1":
+                    sub = re.sub(r'^' + re.escape(root_name), '', clean_name_no_vf, flags=re.IGNORECASE).strip(" -:—")
+                    season_label = sub if sub else f"Autre ({clean_name_no_vf})"
 
             if season_label not in seasons_map:
                 seasons_map[season_label] = {"vostfr": None, "vf": None, "url": link}
 
+            # Si c'est Saison 1 mais que ce n'est PAS la racine, on n'écrase pas
+            if season_label == "Saison 1" and not is_root and seasons_map["Saison 1"]["vostfr"]:
+                continue
+
             if is_vf:
                 seasons_map[season_label]["vf"] = link
+                if not seasons_map[season_label]["url"]:
+                    seasons_map[season_label]["url"] = link
             else:
                 seasons_map[season_label]["vostfr"] = link
                 seasons_map[season_label]["url"] = link
@@ -616,21 +743,35 @@ class VoirAnimeScraper:
 
         http_client, should_close = self._get_active_client()
         sem = asyncio.Semaphore(10)
+        cf_blocked = False
 
         async def resolve_one(ep_num, ep_data):
-            async with sem:
-                try:
-                    resolved = await self.fetch_download_link(ep_data["url"], client=http_client, resolve_stream=True)
-                    if isinstance(resolved, dict):
-                        final_url = resolved.get("stream_url") or resolved.get("iframe_url")
-                    else:
-                        final_url = resolved
+            nonlocal cf_blocked
+            # 1. Vérifier si le flux direct ou le lecteur est déjà en cache
+            if ep_data["url"] in self.streams_cache and self.streams_cache[ep_data["url"]]:
+                c = self.streams_cache[ep_data["url"]]
+                stream = c.get("stream_url") or c.get("iframe_url") if isinstance(c, dict) else c
+                if stream:
+                    return {"episode": ep_num, "url": stream}
 
-                    if final_url:
-                        return {"episode": ep_num, "url": final_url}
-                except Exception:
-                    pass
-                return None
+            # 2. Si pas bloqué par Cloudflare, tenter la résolution dynamique
+            if not cf_blocked:
+                async with sem:
+                    try:
+                        resolved = await self.fetch_download_link(ep_data["url"], client=http_client, resolve_stream=True)
+                        if resolved == "CLOUDFLARE_BLOCKED":
+                            cf_blocked = True
+                        elif isinstance(resolved, dict):
+                            final_url = resolved.get("stream_url") or resolved.get("iframe_url")
+                            if final_url:
+                                return {"episode": ep_num, "url": final_url}
+                        elif resolved:
+                            return {"episode": ep_num, "url": resolved}
+                    except Exception:
+                        pass
+
+            # 3. Ne jamais renvoyer l'URL de la page web VoirAnime comme flux vidéo (incompatible yt-dlp)
+            return None
 
         tasks = [resolve_one(num, ep) for num, ep in episodes_with_num]
         results = await asyncio.gather(*tasks)
@@ -729,6 +870,12 @@ class VoirAnimeScraper:
         return catalog
 
     async def fetch_episodes(self, anime_url: str, client=None) -> list:
+        clean_url = anime_url.rstrip("/") + "/"
+        if clean_url in self.episodes_cache and self.episodes_cache[clean_url]:
+            return self.episodes_cache[clean_url]
+        if anime_url in self.episodes_cache and self.episodes_cache[anime_url]:
+            return self.episodes_cache[anime_url]
+
         http_client, should_close = self._get_active_client(client)
         try:
             resp = await http_client.get(anime_url)
@@ -763,6 +910,10 @@ class VoirAnimeScraper:
                             "url": ep_link
                         })
 
+            if episodes:
+                self.episodes_cache[clean_url] = episodes
+                self.save_episodes_cache()
+
             return episodes
         except Exception as e:
             print(f"Error fetching episodes from {anime_url}: {e}")
@@ -772,9 +923,14 @@ class VoirAnimeScraper:
                 await http_client.aclose()
 
     async def fetch_download_link(self, episode_url: str, client=None, resolve_stream=True):
+        if episode_url in self.streams_cache and self.streams_cache[episode_url]:
+            return self.streams_cache[episode_url]
+
         http_client, should_close = self._get_active_client(client)
         try:
             resp = await http_client.get(episode_url)
+            if resp.status_code in (403, 503) or "challenge" in resp.text.lower():
+                return "CLOUDFLARE_BLOCKED"
             if resp.status_code != 200:
                 return None
 
@@ -837,12 +993,15 @@ class VoirAnimeScraper:
                 try:
                     resolved = await self.resolver.resolve(c_url, client=http_client)
                     if resolved.get("status") == "success" and resolved.get("stream_url"):
-                        return {
+                        res = {
                             "iframe_url": c_url,
                             "stream_url": resolved.get("stream_url"),
                             "stream_type": resolved.get("type"),
                             "host": resolved.get("host") or player_name
                         }
+                        self.streams_cache[episode_url] = res
+                        self.save_streams_cache()
+                        return res
                     elif not first_fallback and resolved.get("stream_url"):
                         first_fallback = {
                             "iframe_url": c_url,
@@ -855,15 +1014,20 @@ class VoirAnimeScraper:
 
             # Si aucun flux direct (.m3u8/.mp4) n'a pu être extrait avec succès, utiliser le premier candidat valide
             if first_fallback:
+                self.streams_cache[episode_url] = first_fallback
+                self.save_streams_cache()
                 return first_fallback
 
             default_candidate = candidates[0][1]
-            return {
+            res = {
                 "iframe_url": default_candidate,
                 "stream_url": default_candidate,
                 "stream_type": "embed",
                 "host": candidates[0][0]
             }
+            self.streams_cache[episode_url] = res
+            self.save_streams_cache()
+            return res
         except Exception as e:
             print(f"Error fetching download link from {episode_url}: {e}")
             return None
